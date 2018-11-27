@@ -1,40 +1,112 @@
 package com.example.hxtruong.ggvisionexample;
 
 import android.Manifest;
+import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
+import android.support.annotation.NonNull;
+import android.support.annotation.RequiresApi;
 import android.support.v4.app.ActivityCompat;
 import android.support.v4.content.ContextCompat;
 import android.support.v4.content.FileProvider;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
+import android.util.Log;
+import android.util.SparseIntArray;
+import android.view.Surface;
 import android.view.View;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.graphics.BitmapFactory;
 import android.widget.TextView;
 
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.OnSuccessListener;
+import com.google.firebase.ml.vision.FirebaseVision;
 import com.google.firebase.ml.vision.common.FirebaseVisionImage;
+import com.google.firebase.ml.vision.common.FirebaseVisionImageMetadata;
 import com.google.firebase.ml.vision.label.FirebaseVisionLabelDetectorOptions;
+import com.google.firebase.ml.vision.text.FirebaseVisionCloudTextRecognizerOptions;
+import com.google.firebase.ml.vision.text.FirebaseVisionText;
+import com.google.firebase.ml.vision.text.FirebaseVisionTextRecognizer;
+import com.google.firebase.ml.vision.text.RecognizedLanguage;
 
 import java.io.File;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
+import java.util.Arrays;
 import java.util.Date;
+import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
+    private static final String TAG = "BAD ROTATION";
     // static final int REQUEST_IMAGE_CAPTURE = 1;
     private ImageView mImageView;
     private Bitmap mImageBitmap;
     static final int REQUEST_TAKE_PHOTO = 1;
     private String mCurrentPhotoPath;
-    private  Button cameraBtn;
+    private Button cameraBtn;
+    private static final SparseIntArray ORIENTATIONS = new SparseIntArray();
 
+    static {
+        ORIENTATIONS.append(Surface.ROTATION_0, 90);
+        ORIENTATIONS.append(Surface.ROTATION_90, 0);
+        ORIENTATIONS.append(Surface.ROTATION_180, 270);
+        ORIENTATIONS.append(Surface.ROTATION_270, 180);
+    }
+
+    /**
+     * Get the angle by which an image must be rotated given the device's current
+     * orientation.
+     */
+    @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
+    private int getRotationCompensation(String cameraId, Activity activity, Context context)
+            throws CameraAccessException {
+        // Get the device's current rotation relative to its "native" orientation.
+        // Then, from the ORIENTATIONS table, look up the angle the image must be
+        // rotated to compensate for the device's rotation.
+        int deviceRotation = activity.getWindowManager().getDefaultDisplay().getRotation();
+        int rotationCompensation = ORIENTATIONS.get(deviceRotation);
+
+        // On most devices, the sensor orientation is 90 degrees, but for some
+        // devices it is 270 degrees. For devices with a sensor orientation of
+        // 270, rotate the image an additional 180 ((270 + 270) % 360) degrees.
+        CameraManager cameraManager = (CameraManager) context.getSystemService(CAMERA_SERVICE);
+        int sensorOrientation = cameraManager
+                .getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.SENSOR_ORIENTATION);
+        rotationCompensation = (rotationCompensation + sensorOrientation + 270) % 360;
+
+        // Return the corresponding FirebaseVisionImageMetadata rotation value.
+        int result;
+        switch (rotationCompensation) {
+            case 0:
+                result = FirebaseVisionImageMetadata.ROTATION_0;
+                break;
+            case 90:
+                result = FirebaseVisionImageMetadata.ROTATION_90;
+                break;
+            case 180:
+                result = FirebaseVisionImageMetadata.ROTATION_180;
+                break;
+            case 270:
+                result = FirebaseVisionImageMetadata.ROTATION_270;
+                break;
+            default:
+                result = FirebaseVisionImageMetadata.ROTATION_0;
+                Log.e(TAG, "Bad rotation value: " + rotationCompensation);
+        }
+        return result;
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -44,10 +116,6 @@ public class MainActivity extends AppCompatActivity {
         ((TextView) (findViewById(R.id.textBox))).setText("Please get a picture");
         mImageView = findViewById(R.id.imageView);
         cameraBtn = findViewById(R.id.cameraBtn);
-//        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-//            cameraBtn.setEnabled(false);
-//            ActivityCompat.requestPermissions(this, new String[] { Manifest.permission.CAMERA, Manifest.permission.WRITE_EXTERNAL_STORAGE }, 0);
-//        }
         onListenerOnButton(cameraBtn);
     }
 
@@ -70,6 +138,7 @@ public class MainActivity extends AppCompatActivity {
                     // optimize picture
                     setPic();//
                     ((TextView) (findViewById(R.id.textBox))).setText("Take photo successful.");
+                    textRecognizer();
                 } else {
                     ((TextView) (findViewById(R.id.textBox))).setText("Can not show this image");
                 }
@@ -140,28 +209,53 @@ public class MainActivity extends AppCompatActivity {
         bmOptions.inSampleSize = scaleFactor;
         bmOptions.inPurgeable = true;
 
-        Bitmap bitmap = BitmapFactory.decodeFile(mCurrentPhotoPath ,bmOptions);
-        mImageView.setImageBitmap(bitmap);
+        mImageBitmap = BitmapFactory.decodeFile(mCurrentPhotoPath, bmOptions);
+        mImageView.setImageBitmap(mImageBitmap);
     }
 
-    private void galleryAddPic() {
-        Intent mediaScanIntent = new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE);
-        File f = new File(mCurrentPhotoPath);
-        Uri contentUri = Uri.fromFile(f);
-        mediaScanIntent.setData(contentUri);
-        this.sendBroadcast(mediaScanIntent);
+    private void textRecognizer() {
+//        FirebaseVisionImage image = FirebaseVisionImage.fromBitmap(mImageBitmap);
+        // obtained being used CameraManager The ID of the camera. Subsequently:
+        //int rotation = getRotationCompensation( MY_CAMERA_ID, this, );
+        //FirebaseVisionImage image = FirebaseVisionImage.fromMediaImage(mImageView, rotation;
+        FirebaseVisionImage image = null ;
+        try {
+            image = FirebaseVisionImage.fromFilePath(this, Uri.fromFile(new File(mCurrentPhotoPath))
+            );
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        FirebaseVisionTextRecognizer textRecognizer = FirebaseVision.getInstance()
+                .getOnDeviceTextRecognizer();
+
+        textRecognizer.processImage(image)
+                .addOnSuccessListener(new OnSuccessListener<FirebaseVisionText>() {
+                    @Override
+                    public void onSuccess(FirebaseVisionText result) {
+                        // Task completed successfully
+                        // ...
+                        TextView textView = findViewById(R.id.textBox);
+                        String resultText = result.getText();
+                        for (FirebaseVisionText.TextBlock block : result.getTextBlocks()) {
+                            String blockText = block.getText();
+                            List<RecognizedLanguage> blockLanguages = block.getRecognizedLanguages();
+                            for (FirebaseVisionText.Line line : block.getLines()) {
+                                String lineText = line.getText();
+                                List<RecognizedLanguage> lineLanguages = line.getRecognizedLanguages();
+                                textView.setText(textView.getText() + "\n" + lineText);
+                            }
+                        }
+                    }
+                })
+                .addOnFailureListener(
+                        new OnFailureListener() {
+                            @Override
+                            public void onFailure(@NonNull Exception e) {
+                                // Task failed with an exception
+                                // ...
+                                ((TextView) (findViewById(R.id.textBox))).setText("Can not read text from this image");
+                            }
+                        });
     }
-
-    void iamgeLabeler() {
-        FirebaseVisionLabelDetectorOptions options =
-                new FirebaseVisionLabelDetectorOptions.Builder()
-                        .setConfidenceThreshold(0.8f)
-                        .build();
-    }
-
-
-//    void runImageLabeler() {
-//        FirebaseVisionImage image = FirebaseVisionImage.fromBitmap(mImageView);
-//
-//    }
 }
