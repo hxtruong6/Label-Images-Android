@@ -1,0 +1,5 @@
+* For Camera:
+Tips: I spend a lot of hours because the stupid problems are:
+    + Check permission of android, especial API >=23
+    + Reduce the size of image before show image to screen
+
